@@ -17,7 +17,8 @@ export const env = {
     required("CEREBRAS_API_KEY", process.env.CEREBRAS_API_KEY),
   cerebrasBaseUrl: () =>
     optional(process.env.CEREBRAS_BASE_URL, "https://api.cerebras.ai/v1"),
-  cerebrasModel: () => optional(process.env.CEREBRAS_MODEL, "gpt-oss-120b"),
+  cerebrasModel: () =>
+    optional(process.env.CEREBRAS_MODEL, "qwen-3-235b-a22b-instruct-2507"),
 
   smtpHost: () => optional(process.env.SMTP_HOST, "smtp.gmail.com"),
   smtpPort: () => Number(optional(process.env.SMTP_PORT, "465")),
@@ -42,21 +43,8 @@ export const env = {
       "http://localhost:3000"
     ),
 
-  // GitHub-backed persistent memory store (no extra service — uses the PAT).
-  //   GITHUB_TOKEN        – personal access token with repo scope
-  //   GITHUB_DATA_REPO    – "<owner>/<repo>" for the data repo
-  //   GITHUB_DATA_BRANCH  – branch (default: main)
-  githubToken: () =>
-    required(
-      "GITHUB_TOKEN",
-      process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN
-    ),
-  githubDataRepo: () =>
-    required(
-      "GITHUB_DATA_REPO",
-      process.env.GITHUB_DATA_REPO ?? process.env.GITHUB_MEMORY_REPO
-    ),
-  githubDataBranch: () => optional(process.env.GITHUB_DATA_BRANCH, "main"),
+  // Neon Postgres connection string (with pgvector extension enabled).
+  databaseUrl: () => required("DATABASE_URL", process.env.DATABASE_URL),
 };
 
 export function safeAppUrl(): string {

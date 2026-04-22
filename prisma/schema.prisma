@@ -1,0 +1,61 @@
+// memchro schema — persistent long-term memory on Neon Postgres + pgvector.
+//
+// Why pgvector: the memory layer needs cosine similarity search over dense
+// 384-dim embeddings (Xenova/all-MiniLM-L6-v2). pgvector is the standard
+// Postgres extension for that and Neon supports it out of the box.
+//
+// Notes:
+//   * `embedding` is typed Unsupported("vector(384)") because Prisma does
+//     not model the pgvector type natively. All similarity queries go
+//     through raw SQL via prisma.$queryRaw.
+//   * We declare the `vector` extension here so `prisma db push` / migrate
+//     will emit `CREATE EXTENSION IF NOT EXISTS vector;` for us.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+model User {
+  id        String   @id
+  email     String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  messages Message[]
+  memories Memory[]
+
+  @@map("users")
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  role      String
+  content   String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("messages")
+}
+
+model Memory {
+  id        String                     @id @default(uuid())
+  userId    String                     @map("user_id")
+  kind      String                     @default("fact") // "fact" | "episode"
+  content   String
+  embedding Unsupported("vector(384)")
+  createdAt DateTime                   @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("memories")
+}
