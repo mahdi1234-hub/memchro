@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-0: #05060a;
+  --bg-1: #0b0f1f;
+  --bg-2: #1a0f3d;
+  --accent: #6c5cff;
+  --accent-2: #22d3ee;
+  --text: #f5f7ff;
+  --text-muted: #a6adc8;
+  --bubble-user: rgba(108, 92, 255, 0.18);
+  --bubble-assistant: rgba(255, 255, 255, 0.06);
+  --border: rgba(255, 255, 255, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  color: var(--text);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background: var(--bg-0);
+}
+
+/*
+ * Static "UnicornStudio-like" background — same colour palette, zero animation
+ * and zero external script. Three layered radial gradients give the scene
+ * depth without ever repainting.
+ */
+.unicorn-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-color: var(--bg-0);
+  background-image:
+    radial-gradient(
+      1200px 800px at 15% 10%,
+      rgba(108, 92, 255, 0.35),
+      transparent 60%
+    ),
+    radial-gradient(
+      1000px 700px at 85% 20%,
+      rgba(34, 211, 238, 0.22),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 900px at 50% 110%,
+      rgba(236, 72, 153, 0.28),
+      transparent 60%
+    ),
+    linear-gradient(180deg, #05060a 0%, #0a0a1a 40%, #050510 100%);
+  background-repeat: no-repeat;
+}
+
+.unicorn-bg::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(
+      circle at 50% 50%,
+      transparent 0%,
+      rgba(0, 0, 0, 0.35) 100%
+    );
+  mix-blend-mode: multiply;
+}
+
+.app-shell {
+  position: relative;
+  z-index: 1;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.glass {
+  background: rgba(10, 12, 24, 0.55);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+
+.chat-bubble-user {
+  background: var(--bubble-user);
+  border: 1px solid rgba(108, 92, 255, 0.35);
+}
+
+.chat-bubble-assistant {
+  background: var(--bubble-assistant);
+  border: 1px solid var(--border);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+}
+
+.input-ring:focus-within {
+  border-color: rgba(108, 92, 255, 0.6);
+  box-shadow: 0 0 0 3px rgba(108, 92, 255, 0.22);
+}
