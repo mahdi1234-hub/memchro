@@ -1,10 +1,8 @@
 import { cookies } from "next/headers";
 import { SignJWT, jwtVerify } from "jose";
 import { env } from "./env";
-import { upsertUser } from "./db";
 
 const SESSION_COOKIE = "memchro_session";
-const LINK_COOKIE = "memchro_link";
 const SESSION_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
 const LINK_MAX_AGE = 60 * 15; // 15 minutes
 
@@ -13,13 +11,12 @@ function secretKey() {
 }
 
 export type SessionPayload = {
-  sub: string; // user id (email hash)
+  sub: string; // stable user id (base64url of email)
   email: string;
   name?: string | null;
 };
 
-function userIdFromEmail(email: string): string {
-  // deterministic, url-safe user id
+export function userIdFromEmail(email: string): string {
   return Buffer.from(email.toLowerCase().trim()).toString("base64url");
 }
 
@@ -46,7 +43,6 @@ export async function verifyMagicLinkToken(
 export async function createSession(email: string): Promise<string> {
   const sub = userIdFromEmail(email);
   const normalized = email.toLowerCase().trim();
-  await upsertUser({ id: sub, email: normalized });
   return new SignJWT({ sub, email: normalized, kind: "session" })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
@@ -97,5 +93,3 @@ export async function requireSession(): Promise<SessionPayload> {
   if (!s) throw new Error("unauthorized");
   return s;
 }
-
-export const AUTH_COOKIES = { SESSION_COOKIE, LINK_COOKIE };

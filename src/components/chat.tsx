@@ -16,7 +16,7 @@ export function Chat({ email }: { email: string }) {
   const [sending, setSending] = useState(false);
   const [showMem, setShowMem] = useState(false);
   const [memories, setMemories] = useState<
-    { id: number; content: string; created_at: string }[]
+    { id: string; content: string; created_at: string }[]
   >([]);
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -77,8 +77,8 @@ export function Chat({ email }: { email: string }) {
         role: "assistant",
         content:
           err instanceof Error
-            ? `⚠️ ${err.message}`
-            : "⚠️ Something went wrong.",
+            ? `⚠ ${err.message}`
+            : "⚠ Something went wrong.",
       };
       setMessages((prev) => [...prev, assistant]);
     } finally {
@@ -98,8 +98,8 @@ export function Chat({ email }: { email: string }) {
     setMemories([]);
   }
 
-  async function forgetOne(id: number) {
-    await fetch(`/api/memories?id=${id}`, { method: "DELETE" });
+  async function forgetOne(id: string) {
+    await fetch(`/api/memories?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     setMemories((m) => m.filter((x) => x.id !== id));
   }
 

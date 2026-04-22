@@ -1,19 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getSession } from "@/lib/auth";
-import { getCerebras, cerebrasModel } from "@/lib/cerebras";
-import {
-  CHAT_SYSTEM,
-  addMemoriesForUser,
-  appendMessage,
-  extractFacts,
-  recentMessages,
-  searchMemories,
-} from "@/lib/memory";
+import { runChatTurn } from "@/lib/memory";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Long-ish limit: embedding cold start + Cerebras call can take a few seconds.
 export const maxDuration = 60;
 
 const Body = z.object({
@@ -32,63 +23,19 @@ export async function POST(req: NextRequest) {
   } catch {
     return NextResponse.json({ error: "Invalid body" }, { status: 400 });
   }
-  const userMessage = parsed.message.trim();
 
-  const userId = session.sub;
-
-  // 1. Recall — semantic search over all memories this user ever produced.
-  const [memories, history] = await Promise.all([
-    searchMemories(userId, userMessage, 8),
-    recentMessages(userId, 16),
-  ]);
-
-  const memoryBlock =
-    memories.length > 0
-      ? `MEMORIES ABOUT ${session.email} (from past conversations — treat as ground truth):\n` +
-        memories.map((m, i) => `  ${i + 1}. ${m.content}`).join("\n")
-      : `No prior memories yet. This is the first substantive exchange with ${session.email}.`;
-
-  const client = getCerebras();
-  const completion = await client.chat.completions.create({
-    model: cerebrasModel(),
-    temperature: 0.4,
-    max_tokens: 800,
-    messages: [
-      { role: "system", content: CHAT_SYSTEM },
-      { role: "system", content: memoryBlock },
-      ...history.map((h) => ({ role: h.role, content: h.content }) as const),
-      { role: "user", content: userMessage },
-    ],
-  });
-
-  const reply =
-    completion.choices[0]?.message?.content?.trim() ??
-    "(no response — please try again)";
-
-  // 2. Persist the turn
-  await appendMessage(userId, "user", userMessage);
-  await appendMessage(userId, "assistant", reply);
-
-  // 3. Fact extraction + memory upsert (fire and forget so we don't block the
-  //    user on a second round trip, but we await because serverless might
-  //    terminate otherwise).
-  let newMemories = 0;
   try {
-    const facts = await extractFacts({
-      recent: history.filter(
-        (h): h is { role: "user" | "assistant"; content: string } =>
-          h.role === "user" || h.role === "assistant"
-      ),
-      latestUserMessage: userMessage,
+    const result = await runChatTurn({
+      userId: session.sub,
+      email: session.email,
+      userMessage: parsed.message.trim(),
     });
-    newMemories = await addMemoriesForUser(userId, facts);
+    return NextResponse.json(result);
   } catch (err) {
-    console.error("memory extraction failed", err);
+    console.error("/api/chat failed", err);
+    return NextResponse.json(
+      { error: "chat_failed", detail: err instanceof Error ? err.message : String(err) },
+      { status: 500 }
+    );
   }
-
-  return NextResponse.json({
-    reply,
-    memoriesUsed: memories.map((m) => m.content),
-    memoriesAdded: newMemories,
-  });
 }

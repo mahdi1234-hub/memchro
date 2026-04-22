@@ -13,7 +13,8 @@ function optional(value: string | undefined, fallback: string): string {
 }
 
 export const env = {
-  cerebrasApiKey: () => required("CEREBRAS_API_KEY", process.env.CEREBRAS_API_KEY),
+  cerebrasApiKey: () =>
+    required("CEREBRAS_API_KEY", process.env.CEREBRAS_API_KEY),
   cerebrasBaseUrl: () =>
     optional(process.env.CEREBRAS_BASE_URL, "https://api.cerebras.ai/v1"),
   cerebrasModel: () => optional(process.env.CEREBRAS_MODEL, "gpt-oss-120b"),
@@ -26,24 +27,36 @@ export const env = {
     optional(process.env.SMTP_FROM, process.env.SMTP_USER ?? "memchro"),
 
   authSecret: () =>
-    required("AUTH_SECRET", process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET),
+    required(
+      "AUTH_SECRET",
+      process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET
+    ),
 
   appUrl: () =>
     optional(
       process.env.NEXT_PUBLIC_APP_URL ??
         process.env.APP_URL ??
-        (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined),
+        (process.env.VERCEL_URL
+          ? `https://${process.env.VERCEL_URL}`
+          : undefined),
       "http://localhost:3000"
     ),
 
-  // Postgres (Vercel Postgres / Neon / any pgvector-enabled PG)
-  postgresUrl: () =>
+  // GitHub-backed persistent memory store (no extra service — uses the PAT).
+  //   GITHUB_TOKEN        – personal access token with repo scope
+  //   GITHUB_DATA_REPO    – "<owner>/<repo>" for the data repo
+  //   GITHUB_DATA_BRANCH  – branch (default: main)
+  githubToken: () =>
     required(
-      "POSTGRES_URL",
-      process.env.POSTGRES_URL ??
-        process.env.DATABASE_URL ??
-        process.env.POSTGRES_PRISMA_URL
+      "GITHUB_TOKEN",
+      process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN
     ),
+  githubDataRepo: () =>
+    required(
+      "GITHUB_DATA_REPO",
+      process.env.GITHUB_DATA_REPO ?? process.env.GITHUB_MEMORY_REPO
+    ),
+  githubDataBranch: () => optional(process.env.GITHUB_DATA_BRANCH, "main"),
 };
 
 export function safeAppUrl(): string {
