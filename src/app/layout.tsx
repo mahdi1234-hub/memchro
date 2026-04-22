@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
 import { Providers } from "@/components/providers";
+import { UnicornBackground } from "@/components/unicorn-background";
 
 const geistSans = localFont({
   src: "./fonts/GeistVF.woff",
@@ -28,7 +29,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable}`}>
-        <div aria-hidden className="unicorn-bg" />
+        <UnicornBackground />
         <Providers>
           <div className="app-shell">{children}</div>
         </Providers>
