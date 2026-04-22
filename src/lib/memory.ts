@@ -1,13 +1,13 @@
-import { ensureSchema, getPool, toPgVector } from "./db";
-import { embed } from "./embeddings";
 import { getCerebras, cerebrasModel } from "./cerebras";
-
-export type Memory = {
-  id: number;
-  user_id: string;
-  content: string;
-  created_at: string;
-};
+import { embed } from "./embeddings";
+import {
+  loadUserFile,
+  saveUserFile,
+  trimMessages,
+  type StoredMemory,
+  type StoredMessage,
+  type UserFile,
+} from "./storage";
 
 const FACT_EXTRACTION_SYSTEM = `You are a memory engine for a long-lived personal AI assistant.
 Your job is to read the LATEST USER MESSAGE (given the short context of the ongoing conversation)
@@ -23,7 +23,7 @@ Rules:
 - If there are no durable facts, return {"facts": []}.
 - Do not invent facts. Only capture what the user said.`;
 
-const CHAT_SYSTEM = `You are memchro — a warm, sharp AI companion with perfect, permanent memory.
+export const CHAT_SYSTEM = `You are memchro — a warm, sharp AI companion with perfect, permanent memory.
 You have access to a set of MEMORIES about the user that were extracted from past conversations.
 Always treat those memories as ground truth about this specific user and weave them naturally into
 your replies when relevant. Never claim to have forgotten something that is in the memory list.
@@ -49,11 +49,6 @@ function tryParseFacts(raw: string): string[] {
   return [];
 }
 
-/**
- * Ask Cerebras to distil durable facts out of the latest user turn, given the
- * small rolling context of the conversation. This mirrors what Mem0 does in
- * its "extract" step.
- */
 export async function extractFacts(params: {
   recent: { role: "user" | "assistant"; content: string }[];
   latestUserMessage: string;
@@ -82,120 +77,199 @@ export async function extractFacts(params: {
   return tryParseFacts(raw);
 }
 
-export async function addMemoriesForUser(
-  userId: string,
-  facts: string[]
-): Promise<number> {
-  if (facts.length === 0) return 0;
-  await ensureSchema();
-  const pool = getPool();
-
-  // dedupe within this batch on lowercased content
-  const unique = Array.from(
-    new Map(facts.map((f) => [f.toLowerCase(), f])).values()
-  );
-
-  let inserted = 0;
-  for (const fact of unique) {
-    // Skip if a near-identical memory already exists
-    const { rows: existing } = await pool.query<{ id: number }>(
-      `SELECT id FROM memories
-        WHERE user_id = $1 AND LOWER(content) = LOWER($2)
-        LIMIT 1`,
-      [userId, fact]
-    );
-    if (existing.length > 0) continue;
-
-    const vec = await embed(fact);
-    await pool.query(
-      `INSERT INTO memories (user_id, content, embedding)
-       VALUES ($1, $2, $3::vector)`,
-      [userId, fact, toPgVector(vec)]
-    );
-    inserted++;
+function cosine(a: number[], b: number[]): number {
+  if (a.length !== b.length) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
   }
-  return inserted;
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 0 : dot / denom;
 }
 
-export async function searchMemories(
-  userId: string,
-  query: string,
-  k = 6
-): Promise<Memory[]> {
-  await ensureSchema();
-  const pool = getPool();
-  const vec = await embed(query);
-  const { rows } = await pool.query<Memory>(
-    `SELECT id, user_id, content, created_at
-       FROM memories
-      WHERE user_id = $1
-      ORDER BY embedding <=> $2::vector
-      LIMIT $3`,
-    [userId, toPgVector(vec), k]
-  );
-  return rows;
+export function searchMemoriesIn(
+  memories: StoredMemory[],
+  queryEmbedding: number[],
+  k = 8
+): StoredMemory[] {
+  return memories
+    .map((m) => ({ m, score: cosine(m.embedding, queryEmbedding) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k)
+    .map((x) => x.m);
 }
 
-export async function listMemories(userId: string, limit = 200): Promise<Memory[]> {
-  await ensureSchema();
-  const pool = getPool();
-  const { rows } = await pool.query<Memory>(
-    `SELECT id, user_id, content, created_at
-       FROM memories
-      WHERE user_id = $1
-      ORDER BY created_at DESC
-      LIMIT $2`,
-    [userId, limit]
-  );
-  return rows;
+export function dedupeAndAppend(
+  existing: StoredMemory[],
+  newFacts: { content: string; embedding: number[] }[]
+): { merged: StoredMemory[]; added: number } {
+  const seen = new Set(existing.map((m) => m.content.trim().toLowerCase()));
+  let added = 0;
+  const out = [...existing];
+  for (const f of newFacts) {
+    const key = f.content.trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      id: crypto.randomUUID(),
+      content: f.content.trim(),
+      embedding: f.embedding,
+      created_at: new Date().toISOString(),
+    });
+    added++;
+  }
+  return { merged: out, added };
 }
 
-export async function deleteMemory(userId: string, id: number): Promise<void> {
-  await ensureSchema();
-  const pool = getPool();
-  await pool.query(`DELETE FROM memories WHERE user_id = $1 AND id = $2`, [
+export type ChatTurnResult = {
+  reply: string;
+  memoriesUsed: string[];
+  memoriesAdded: number;
+};
+
+export async function runChatTurn(params: {
+  userId: string;
+  email: string;
+  userMessage: string;
+}): Promise<ChatTurnResult> {
+  const { userId, email, userMessage } = params;
+
+  const { file, sha } = await loadUserFile({ userId, email });
+
+  // 1. Embed the user message and recall relevant memories.
+  const queryVec = await embed(userMessage);
+  const recalled = searchMemoriesIn(file.memories, queryVec, 8);
+
+  const memoryBlock =
+    recalled.length > 0
+      ? `MEMORIES ABOUT ${email} (from past conversations — treat as ground truth):\n` +
+        recalled.map((m, i) => `  ${i + 1}. ${m.content}`).join("\n")
+      : `No prior memories yet. This is the first substantive exchange with ${email}.`;
+
+  const history = trimMessages(file.messages);
+
+  // 2. Generate reply with Cerebras.
+  const client = getCerebras();
+  const completion = await client.chat.completions.create({
+    model: cerebrasModel(),
+    temperature: 0.4,
+    max_tokens: 800,
+    messages: [
+      { role: "system", content: CHAT_SYSTEM },
+      { role: "system", content: memoryBlock },
+      ...history
+        .filter(
+          (h): h is StoredMessage & { role: "user" | "assistant" | "system" } =>
+            h.role === "user" || h.role === "assistant" || h.role === "system"
+        )
+        .slice(-16)
+        .map((h) => ({ role: h.role, content: h.content }) as const),
+      { role: "user", content: userMessage },
+    ],
+  });
+
+  const reply =
+    completion.choices[0]?.message?.content?.trim() ??
+    "(no response — please try again)";
+
+  // 3. Append messages.
+  const now = new Date().toISOString();
+  const appendedMessages: StoredMessage[] = [
+    ...history,
+    { role: "user", content: userMessage, created_at: now },
+    { role: "assistant", content: reply, created_at: now },
+  ];
+
+  // 4. Extract durable facts + embed + upsert.
+  let memoriesAdded = 0;
+  let newMemories: StoredMemory[] = file.memories;
+  try {
+    const facts = await extractFacts({
+      recent: history
+        .filter(
+          (h): h is StoredMessage & { role: "user" | "assistant" } =>
+            h.role === "user" || h.role === "assistant"
+        )
+        .map((h) => ({ role: h.role, content: h.content })),
+      latestUserMessage: userMessage,
+    });
+    if (facts.length > 0) {
+      const embeddings = await Promise.all(facts.map((f) => embed(f)));
+      const factsWithVecs = facts.map((content, i) => ({
+        content,
+        embedding: embeddings[i],
+      }));
+      const { merged, added } = dedupeAndAppend(file.memories, factsWithVecs);
+      newMemories = merged;
+      memoriesAdded = added;
+    }
+  } catch (err) {
+    console.error("memory extraction failed", err);
+  }
+
+  // 5. Persist everything back to GitHub in a single PUT.
+  const updated: UserFile = {
+    version: 1,
+    email,
+    memories: newMemories,
+    messages: trimMessages(appendedMessages),
+  };
+  await saveUserFile({
     userId,
-    id,
-  ]);
+    file: updated,
+    sha,
+    message: `memchro: ${email} +${memoriesAdded} memory`,
+  });
+
+  return {
+    reply,
+    memoriesUsed: recalled.map((m) => m.content),
+    memoriesAdded,
+  };
 }
 
-export async function deleteAllMemories(userId: string): Promise<void> {
-  await ensureSchema();
-  const pool = getPool();
-  await pool.query(`DELETE FROM memories WHERE user_id = $1`, [userId]);
+export async function listMemoriesForUser(params: {
+  userId: string;
+  email: string;
+}): Promise<{ id: string; content: string; created_at: string }[]> {
+  const { file } = await loadUserFile(params);
+  return file.memories
+    .map((m) => ({ id: m.id, content: m.content, created_at: m.created_at }))
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
 }
 
-export async function appendMessage(
-  userId: string,
-  role: "user" | "assistant" | "system",
-  content: string
-): Promise<void> {
-  await ensureSchema();
-  const pool = getPool();
-  await pool.query(
-    `INSERT INTO messages (user_id, role, content) VALUES ($1, $2, $3)`,
-    [userId, role, content]
-  );
+export async function deleteMemoryForUser(params: {
+  userId: string;
+  email: string;
+  id: string;
+}): Promise<void> {
+  const { file, sha } = await loadUserFile({
+    userId: params.userId,
+    email: params.email,
+  });
+  const filtered = file.memories.filter((m) => m.id !== params.id);
+  if (filtered.length === file.memories.length) return;
+  await saveUserFile({
+    userId: params.userId,
+    file: { ...file, memories: filtered },
+    sha,
+    message: `memchro: forget 1 memory for ${params.email}`,
+  });
 }
 
-export async function recentMessages(
-  userId: string,
-  limit = 20
-): Promise<{ role: "user" | "assistant" | "system"; content: string }[]> {
-  await ensureSchema();
-  const pool = getPool();
-  const { rows } = await pool.query<{
-    role: "user" | "assistant" | "system";
-    content: string;
-  }>(
-    `SELECT role, content
-       FROM messages
-      WHERE user_id = $1
-      ORDER BY created_at DESC
-      LIMIT $2`,
-    [userId, limit]
-  );
-  return rows.reverse();
+export async function deleteAllMemoriesForUser(params: {
+  userId: string;
+  email: string;
+}): Promise<void> {
+  const { file, sha } = await loadUserFile(params);
+  await saveUserFile({
+    userId: params.userId,
+    file: { ...file, memories: [] },
+    sha,
+    message: `memchro: forget all memories for ${params.email}`,
+  });
 }
-
-export { CHAT_SYSTEM };
