@@ -1,207 +1,291 @@
 /**
- * GitHub-backed persistent storage for memchro.
+ * Neon Postgres + pgvector persistent storage for memchro.
  *
- * Why? Our deployment target is Vercel serverless, which has an ephemeral
- * filesystem. We want a single external dependency — the user's GitHub PAT
- * they already provided — to act as a true 24/7 persistent database.
+ * Why this design:
+ *   - Vercel serverless has an ephemeral filesystem. We need a real external
+ *     DB for 24/7 memory. Neon gives us serverless Postgres with `pgvector`,
+ *     which is the proper vector-search substrate.
+ *   - Everything the agent knows about a user is two tables:
+ *       messages   — the raw running transcript (so we can replay the
+ *                    last N turns into the LLM's context window).
+ *       memories   — extracted facts + episodic snippets, each with a
+ *                    384-dim embedding for semantic recall.
+ *   - We use pgvector's `<=>` cosine-distance operator and an HNSW index
+ *     for sub-millisecond top-K search even at millions of rows.
  *
- * Layout (inside $GITHUB_DATA_REPO):
- *
- *   users/<userId>.json         {
- *     version: 1,
- *     email: "...",
- *     memories: [ { id, content, embedding, created_at } ],
- *     messages: [ { role, content, created_at } ]
- *   }
- *
- * userId is a url-safe base64 of the user's lowercased email — stable across
- * sessions and containers, and safe to use as a filename.
- *
- * Each chat turn does one GET and one PUT per user's file. We keep the last
- * 200 messages and unlimited memories (deduped + optionally trimmed).
+ * We expose a small, typed API over the Prisma client so the rest of the
+ * codebase (memory.ts, API routes) never deals with raw SQL.
  */
 
-import { env } from "./env";
+import { prisma } from "./prisma";
 
 export type StoredMemory = {
   id: string;
+  userId: string;
+  kind: "fact" | "episode";
   content: string;
   embedding: number[];
   created_at: string;
 };
 
 export type StoredMessage = {
+  id: string;
   role: "user" | "assistant" | "system";
   content: string;
   created_at: string;
 };
 
-export type UserFile = {
-  version: 1;
-  email: string;
-  memories: StoredMemory[];
-  messages: StoredMessage[];
-};
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-const MAX_MESSAGES = 200;
-
-function apiRoot(): string {
-  return `https://api.github.com/repos/${env.githubDataRepo()}/contents`;
+function toPgVector(v: number[]): string {
+  // pgvector input format is "[0.1,0.2,...]".
+  return `[${v.join(",")}]`;
 }
 
-function userFilePath(userId: string): string {
-  return `users/${encodeURIComponent(userId)}.json`;
-}
-
-async function ghFetch(
-  url: string,
-  init?: RequestInit
-): Promise<Response> {
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${env.githubToken()}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "memchro",
-      ...(init?.headers ?? {}),
-      ...(init?.body
-        ? { "Content-Type": "application/json" }
-        : {}),
-    },
-    // Always bust the CDN cache — memory data is not cacheable.
-    cache: "no-store",
-  });
-  return res;
-}
-
-/**
- * Load the user's file. Returns `{ file: null, sha: null }` if the file does
- * not exist yet.
- */
-export async function loadUserFile(params: {
-  userId: string;
-  email: string;
-}): Promise<{ file: UserFile; sha: string | null }> {
-  const url = `${apiRoot()}/${userFilePath(params.userId)}?ref=${encodeURIComponent(env.githubDataBranch())}`;
-  const res = await ghFetch(url);
-  if (res.status === 404) {
-    return {
-      file: {
-        version: 1,
-        email: params.email,
-        memories: [],
-        messages: [],
-      },
-      sha: null,
-    };
-  }
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub load failed (${res.status}): ${text}`);
-  }
-  const json = (await res.json()) as {
-    sha: string;
-    content: string;
-    encoding: string;
+function rowToMemory(r: {
+  id: string;
+  user_id: string;
+  kind: string;
+  content: string;
+  embedding: string | number[];
+  created_at: Date | string;
+}): StoredMemory {
+  const emb =
+    Array.isArray(r.embedding)
+      ? (r.embedding as number[])
+      : parsePgVector(r.embedding as string);
+  return {
+    id: r.id,
+    userId: r.user_id,
+    kind: r.kind === "episode" ? "episode" : "fact",
+    content: r.content,
+    embedding: emb,
+    created_at:
+      r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at,
   };
-  const raw = Buffer.from(json.content, "base64").toString("utf8");
-  let parsed: UserFile;
-  try {
-    parsed = JSON.parse(raw) as UserFile;
-  } catch {
-    parsed = {
-      version: 1,
-      email: params.email,
-      memories: [],
-      messages: [],
-    };
-  }
-  // Back-fill defaults for forward compatibility.
-  parsed.version = 1;
-  parsed.email = parsed.email || params.email;
-  parsed.memories = Array.isArray(parsed.memories) ? parsed.memories : [];
-  parsed.messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-  return { file: parsed, sha: json.sha };
 }
 
-/**
- * Persist the user's file via the Contents API. If `sha` is null we create;
- * otherwise we update. We retry once on 409 (concurrent write) by re-reading.
- */
-export async function saveUserFile(params: {
+function parsePgVector(s: string): number[] {
+  // "[0.1,0.2,...]" -> [0.1, 0.2, ...]
+  if (!s) return [];
+  const trimmed = s.trim().replace(/^\[/, "").replace(/\]$/, "");
+  if (!trimmed) return [];
+  return trimmed.split(",").map((x) => Number(x));
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+export async function ensureUser(params: {
   userId: string;
-  file: UserFile;
-  sha: string | null;
-  message?: string;
-}): Promise<{ sha: string }> {
-  const body = JSON.stringify(params.file, null, 2);
-  const content = Buffer.from(body, "utf8").toString("base64");
-  const url = `${apiRoot()}/${userFilePath(params.userId)}`;
-  async function put(sha: string | null) {
-    return ghFetch(url, {
-      method: "PUT",
-      body: JSON.stringify({
-        message:
-          params.message ??
-          `memchro: update memory for ${params.userId.slice(0, 8)}…`,
-        content,
-        branch: env.githubDataBranch(),
-        ...(sha ? { sha } : {}),
-      }),
-    });
-  }
-  let res = await put(params.sha);
-  if (res.status === 409 || res.status === 422) {
-    // conflict — re-read latest sha and retry once
-    const refreshed = await loadUserFile({
+  email: string;
+}): Promise<void> {
+  await prisma.user.upsert({
+    where: { id: params.userId },
+    create: { id: params.userId, email: params.email.toLowerCase() },
+    update: { email: params.email.toLowerCase() },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+export async function getRecentMessages(params: {
+  userId: string;
+  limit?: number;
+}): Promise<StoredMessage[]> {
+  const limit = params.limit ?? 80;
+  const rows = await prisma.message.findMany({
+    where: { userId: params.userId },
+    orderBy: { createdAt: "desc" },
+    take: limit,
+  });
+  // We fetched newest-first for the LIMIT to work; flip to oldest-first for
+  // feeding into the LLM's context window.
+  return rows.reverse().map((r) => ({
+    id: r.id,
+    role: r.role as StoredMessage["role"],
+    content: r.content,
+    created_at: r.createdAt.toISOString(),
+  }));
+}
+
+export async function appendMessages(params: {
+  userId: string;
+  messages: { role: StoredMessage["role"]; content: string }[];
+}): Promise<void> {
+  if (params.messages.length === 0) return;
+  await prisma.message.createMany({
+    data: params.messages.map((m) => ({
       userId: params.userId,
-      email: params.file.email,
+      role: m.role,
+      content: m.content,
+    })),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Memories
+// ---------------------------------------------------------------------------
+
+export async function searchMemoriesByEmbedding(params: {
+  userId: string;
+  queryEmbedding: number[];
+  limit?: number;
+  kind?: "fact" | "episode";
+}): Promise<StoredMemory[]> {
+  const limit = params.limit ?? 24;
+  const vec = toPgVector(params.queryEmbedding);
+  const rows = params.kind
+    ? await prisma.$queryRawUnsafe<
+        {
+          id: string;
+          user_id: string;
+          kind: string;
+          content: string;
+          embedding: string;
+          created_at: Date;
+        }[]
+      >(
+        `SELECT id, user_id, kind, content, embedding::text AS embedding, created_at
+           FROM memories
+          WHERE user_id = $1 AND kind = $2
+          ORDER BY embedding <=> $3::vector
+          LIMIT $4`,
+        params.userId,
+        params.kind,
+        vec,
+        limit
+      )
+    : await prisma.$queryRawUnsafe<
+        {
+          id: string;
+          user_id: string;
+          kind: string;
+          content: string;
+          embedding: string;
+          created_at: Date;
+        }[]
+      >(
+        `SELECT id, user_id, kind, content, embedding::text AS embedding, created_at
+           FROM memories
+          WHERE user_id = $1
+          ORDER BY embedding <=> $2::vector
+          LIMIT $3`,
+        params.userId,
+        vec,
+        limit
+      );
+  return rows.map(rowToMemory);
+}
+
+export async function getRecentMemories(params: {
+  userId: string;
+  limit?: number;
+}): Promise<StoredMemory[]> {
+  const limit = params.limit ?? 12;
+  const rows = await prisma.$queryRawUnsafe<
+    {
+      id: string;
+      user_id: string;
+      kind: string;
+      content: string;
+      embedding: string;
+      created_at: Date;
+    }[]
+  >(
+    `SELECT id, user_id, kind, content, embedding::text AS embedding, created_at
+       FROM memories
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      LIMIT $2`,
+    params.userId,
+    limit
+  );
+  return rows.map(rowToMemory);
+}
+
+export async function appendMemory(params: {
+  userId: string;
+  content: string;
+  embedding: number[];
+  kind: "fact" | "episode";
+}): Promise<StoredMemory> {
+  const vec = toPgVector(params.embedding);
+  // Dedupe facts by exact content match for this user.
+  if (params.kind === "fact") {
+    const existing = await prisma.memory.findFirst({
+      where: {
+        userId: params.userId,
+        kind: "fact",
+        content: params.content,
+      },
     });
-    // merge conservatively: keep union of memories + latest messages
-    const merged: UserFile = {
-      version: 1,
-      email: params.file.email,
-      memories: mergeMemories(refreshed.file.memories, params.file.memories),
-      messages: params.file.messages.slice(-MAX_MESSAGES),
-    };
-    const bodyRetry = JSON.stringify(merged, null, 2);
-    const contentRetry = Buffer.from(bodyRetry, "utf8").toString("base64");
-    res = await ghFetch(url, {
-      method: "PUT",
-      body: JSON.stringify({
-        message: params.message ?? "memchro: update memory (retry)",
-        content: contentRetry,
-        branch: env.githubDataBranch(),
-        ...(refreshed.sha ? { sha: refreshed.sha } : {}),
-      }),
-    });
+    if (existing) {
+      return {
+        id: existing.id,
+        userId: existing.userId,
+        kind: "fact",
+        content: existing.content,
+        embedding: params.embedding,
+        created_at: existing.createdAt.toISOString(),
+      };
+    }
   }
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub save failed (${res.status}): ${text}`);
-  }
-  const json = (await res.json()) as { content: { sha: string } };
-  return { sha: json.content.sha };
+  const [row] = await prisma.$queryRawUnsafe<
+    {
+      id: string;
+      user_id: string;
+      kind: string;
+      content: string;
+      embedding: string;
+      created_at: Date;
+    }[]
+  >(
+    `INSERT INTO memories (id, user_id, kind, content, embedding, created_at)
+     VALUES (gen_random_uuid(), $1, $2, $3, $4::vector, NOW())
+     RETURNING id, user_id, kind, content, embedding::text AS embedding, created_at`,
+    params.userId,
+    params.kind,
+    params.content,
+    vec
+  );
+  return rowToMemory(row);
 }
 
-function mergeMemories(
-  a: StoredMemory[],
-  b: StoredMemory[]
-): StoredMemory[] {
-  const seen = new Set<string>();
-  const out: StoredMemory[] = [];
-  for (const m of [...a, ...b]) {
-    const key = m.content.trim().toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(m);
-  }
-  return out;
+export async function listMemoriesForPanel(params: {
+  userId: string;
+}): Promise<{ id: string; content: string; kind: "fact" | "episode"; created_at: string }[]> {
+  const rows = await prisma.memory.findMany({
+    where: { userId: params.userId },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, content: true, kind: true, createdAt: true },
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    content: r.content,
+    kind: r.kind === "episode" ? "episode" : "fact",
+    created_at: r.createdAt.toISOString(),
+  }));
 }
 
-export function trimMessages(messages: StoredMessage[]): StoredMessage[] {
-  return messages.slice(-MAX_MESSAGES);
+export async function deleteMemory(params: {
+  userId: string;
+  id: string;
+}): Promise<void> {
+  await prisma.memory.deleteMany({
+    where: { id: params.id, userId: params.userId },
+  });
 }
 
-export const MEMCHRO_STORAGE_MAX_MESSAGES = MAX_MESSAGES;
+export async function deleteAllMemories(params: {
+  userId: string;
+}): Promise<void> {
+  await prisma.memory.deleteMany({
+    where: { userId: params.userId },
+  });
+}
